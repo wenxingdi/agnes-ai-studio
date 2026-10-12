@@ -1,0 +1,8 @@
+{
+  "upstream": "https://github.com/LGQLIFE/agnes-ai-studio.git",
+  "branches": ["main", "master"],
+  "primary": "master",
+  "mode": "merge",
+  "syncTags": true,
+  "note": "branches 列出要跟随上游同步的全部分支。primary 只是说明本仓库的默认分支应是哪个（默认分支需在仓库 Settings 里设置，工作流不会自动改）。mode=merge 保留你自己的改动并与上游合并；mode=mirror 直接硬覆盖为上游最新（会丢弃本地改动）。"
+}

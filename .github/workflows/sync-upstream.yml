@@ -1,0 +1,161 @@
+name: Sync Upstream
+
+# 定时检查上游源仓库是否有新提交，有则自动把「配置里的所有分支」同步到本仓库。
+# 运行在 GitHub 服务器上，本机是否开机、本机网络是否通畅都不影响。
+#
+# 手动触发：仓库页面 -> Actions -> Sync Upstream -> Run workflow
+
+on:
+  schedule:
+    # 每天 UTC 02:17（北京时间 10:17）检查一次。
+    # GitHub 定时任务在整点高峰期可能延迟数分钟到数十分钟。
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "即使检测到无更新，也强制执行一次同步推送"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出本仓库（完整历史）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 读取上游配置
+        id: cfg
+        run: |
+          set -euo pipefail
+          CFG=".github/upstream-sync.json"
+          [ -f "$CFG" ] || { echo "::error::缺少配置文件 $CFG"; exit 1; }
+          UP="$(jq -r '.upstream' "$CFG")"
+          BRANCHES="$(jq -r 'if (.branches | type) == "array" and (.branches | length) > 0 then (.branches | join(" ")) else (.branch // "main") end' "$CFG")"
+          MODE="$(jq -r '.mode // "merge"' "$CFG")"
+          SYNC_TAGS="$(jq -r '.syncTags // true' "$CFG")"
+          {
+            echo "upstream=$UP"
+            echo "branches=$BRANCHES"
+            echo "mode=$MODE"
+            echo "sync_tags=$SYNC_TAGS"
+          } >> "$GITHUB_OUTPUT"
+          echo "上游：$UP"
+          echo "分支：$BRANCHES"
+          echo "模式：$MODE"
+
+      - name: 同步各分支
+        id: sync
+        run: |
+          set -euo pipefail
+          UP="${{ steps.cfg.outputs.upstream }}"
+          BRANCHES="${{ steps.cfg.outputs.branches }}"
+          MODE="${{ steps.cfg.outputs.mode }}"
+          FORCE="${{ inputs.force }}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UP" 2>/dev/null || git remote set-url upstream "$UP"
+          git fetch upstream --prune --tags --force
+          git fetch origin   --prune --tags --force || true
+
+          # 同步文件本身上游没有，先备份，稍后装回每个分支
+          rm -rf /tmp/keep && mkdir -p /tmp/keep
+          cp -r .github /tmp/keep/
+
+          ANY=false
+          for BR in $BRANCHES; do
+            echo "======================== 分支 $BR ========================"
+
+            if ! git rev-parse --verify --quiet "refs/remotes/upstream/$BR" >/dev/null; then
+              echo "::warning::上游不存在分支 $BR，跳过"
+              continue
+            fi
+
+            # 判定是否需要「首次引导」：本仓库远端还没有该分支，或与上游无共同祖先
+            BOOTSTRAP=false
+            if ! git rev-parse --verify --quiet "refs/remotes/origin/$BR" >/dev/null; then
+              BOOTSTRAP=true
+            elif ! git merge-base "refs/remotes/origin/$BR" "refs/remotes/upstream/$BR" >/dev/null 2>&1; then
+              BOOTSTRAP=true
+            fi
+
+            if [ "$BOOTSTRAP" = "true" ]; then
+              echo "🚀 首次引导：$BR 对齐上游最新并装载同步工作流"
+              git checkout -B "$BR" "refs/remotes/upstream/$BR"
+              mkdir -p .github
+              cp -rf /tmp/keep/.github/. .github/
+              git add -A .github
+              git commit -m "chore(ci): 安装上游自动同步工作流" >/dev/null || echo "（无文件变更）"
+              git push origin "refs/heads/$BR:refs/heads/$BR" --force
+              ANY=true
+              continue
+            fi
+
+            git checkout -B "$BR" "refs/remotes/origin/$BR"
+
+            UP_TO_DATE=false
+            git merge-base --is-ancestor "refs/remotes/upstream/$BR" HEAD 2>/dev/null && UP_TO_DATE=true
+
+            if [ "$UP_TO_DATE" = "true" ] && [ "$FORCE" != "true" ]; then
+              echo "✅ $BR 已是最新，无需同步"
+              continue
+            fi
+
+            if [ "$UP_TO_DATE" = "false" ]; then
+              echo "🔔 $BR 检测到上游更新："
+              git log --oneline --no-decorate "HEAD..refs/remotes/upstream/$BR" | head -20
+            else
+              echo "（强制执行：上游无新提交，仅重推一次）"
+            fi
+
+            if [ "$MODE" = "mirror" ]; then
+              echo "::warning::mirror 模式：$BR 将被硬重置为上游状态，本地改动会被丢弃。"
+              git reset --hard "refs/remotes/upstream/$BR"
+              mkdir -p .github
+              cp -rf /tmp/keep/.github/. .github/
+              git add -A .github
+              git commit -m "chore(ci): 安装上游自动同步工作流" >/dev/null || echo "（无文件变更）"
+              git push origin "refs/heads/$BR:refs/heads/$BR" --force
+            elif [ "$UP_TO_DATE" = "true" ]; then
+              git push origin "refs/heads/$BR:refs/heads/$BR" || echo "（远端已一致）"
+            else
+              if ! git merge --no-edit "refs/remotes/upstream/$BR"; then
+                echo "::error::$BR 合并冲突，自动同步中止。请在本地手动处理冲突后再跑一次。"
+                echo "=== 冲突文件 ==="
+                git diff --name-only --diff-filter=U
+                exit 1
+              fi
+              git push origin "refs/heads/$BR:refs/heads/$BR"
+            fi
+            ANY=true
+          done
+
+          echo "changed=$ANY" >> "$GITHUB_OUTPUT"
+
+      - name: 同步 tag
+        if: steps.cfg.outputs.sync_tags == 'true'
+        run: git push origin --tags || true
+
+      - name: 写入运行摘要
+        if: always()
+        run: |
+          {
+            echo "## 上游同步结果"
+            echo ""
+            echo "- 上游：\`${{ steps.cfg.outputs.upstream }}\`"
+            echo "- 分支：\`${{ steps.cfg.outputs.branches }}\`"
+            echo "- 模式：\`${{ steps.cfg.outputs.mode }}\`"
+            echo "- 是否有分支变动：\`${{ steps.sync.outputs.changed || '未知' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
